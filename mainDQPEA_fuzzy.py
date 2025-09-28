@@ -1,9 +1,17 @@
 # coding:utf-8
 import copy
-
-from DataRead import DataReadDHFJSP
 import numpy as np
 import os
+import math
+import random
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import re
+from abc import ABC
+from DataRead import DataReadDHFJSP
 from Initial import GHInitial
 from inital import initial
 from fitFJSP import CalfitDHFJFP
@@ -14,129 +22,102 @@ from FastNDSort import FastNDS
 from EnergySave import EnergysavingDHFJSP
 from LocalSearch import *
 from DQN_model import DQN
-import torch
-import matplotlib.pyplot as plt
-import re
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from abc import ABC
-import numpy as np
 
 def DataReadDHFJSP(Filepath):
-    with open(Filepath, "r", encoding='utf-8') as f1:
-        lines = f1.readlines()
-
+    try:
+        with open(Filepath, "r", encoding='utf-8') as f1:
+            lines = f1.readlines()
+    except FileNotFoundError:
+        print(f"文件 {Filepath} 未找到")
+        sys.exit(1)
     N, F, TM = map(int, lines[0].split())
     H = [0] * N
-    opmax = 5  # 假设最大工序数 5
-    NM = np.zeros((F, N, opmax), dtype=int)
-    M = np.zeros((F, N, opmax, TM), dtype=int)
-    time = np.zeros((F, N, opmax, TM, 3), dtype=int)
-    ProF = np.zeros((N, F))
-
+    op_list = []
     line_idx = 1
     f = 0
+    # 初始化数组
+    opmax = 5  # 初始假设，之后更新
+    time = np.zeros((F, N, opmax, TM, 3), dtype=int)
+    NM = np.zeros((F, N, opmax), dtype=int)
+    M = np.zeros((F, N, opmax, TM), dtype=int)
+    ProF = np.zeros((N, F))
     while line_idx < len(lines):
         line = lines[line_idx].strip()
         line_idx += 1
         if not line:
             continue
-        tokens = re.findall(r'\d+|\(\d+,\d+,\d+\)', line)
+        tokens = re.findall(r'(\d+)\s*\((\d+,\d+,\d+)\)', line)  # 匹配 "m (l,m,u)" 模式
         if not tokens:
+            # 尝试解析工厂/作业/工序数
+            tokens = re.findall(r'\d+', line)
+            if len(tokens) == 3 and all(t.isdigit() for t in tokens):
+                f = int(tokens[0]) - 1
+                j = int(tokens[1]) - 1
+                H[j] = int(tokens[2])
+                op_list.append(H[j])
+                continue
             continue
-        # f j H[j]
-        if len(tokens) == 3 and all(t.isdigit() for t in tokens):
-            f = int(tokens[0]) - 1
-            j = int(tokens[1]) - 1
-            H[j] = int(tokens[2])
-            continue
-        # Op line: op NM_o m1 time1 m2 time2 ...
-        o = int(tokens[0]) - 1
-        NM_o = int(tokens[1])
-        NM[f][j][o] = NM_o
-        token_idx = 2
-        for k in range(NM_o):
-            m = int(tokens[token_idx])
-            token_idx += 1
-            fuzzy = tokens[token_idx]
-            token_idx += 1
-            nums = re.findall(r'\d+', fuzzy)
-            l, m_val, u = map(int, nums)
-            t = m - 1
-            time[f][j][o][t] = [l, m_val, u]
-            M[f][j][o][k] = m
-
-    SH = sum(H)
-
-    # ProF 计算
-    for ff in range(F):
-        for ii in range(N):
-            toTime = 0
-            for jj in range(H[ii]):
-                averT = 0
-                NM1 = NM[ff][ii][jj]
-                for k in range(NM1):
-                    mc = M[ff][ii][jj][k] - 1
-                    averT += (time[ff][ii][jj][mc][0] + 2 * time[ff][ii][jj][mc][1] + time[ff][ii][jj][mc][2]) // 4
-                if NM1 > 0:
-                    averT /= NM1
-                toTime += averT
-            ProF[ii][ff] = toTime
-
-    for ii in range(N):
-        tot = np.sum(ProF[ii])
-        if tot > 0:
-            ProF[ii] = ProF[ii] / tot
-
+        # 解析工序和机器信息
+        if 'o' not in locals():
+            o = 0  # 假设第一行是工序 1
+        else:
+            o += 1  # 递增工序号
+        NM_o = len(tokens)  # 可用机器数
+        if NM_o > 0:
+            for m_idx, (machine, fuzzy_str) in enumerate(tokens):
+                machine = int(machine) - 1  # 机器号从 0 开始
+                l, m_val, u = map(int, fuzzy_str.strip('()').split(','))
+                if f < F and j < N and o < opmax and machine < TM:
+                    time[f][j][o][machine] = [l, m_val, u]
+                    M[f][j][o][machine] = machine + 1  # 机器索引 (1-based)
+                    NM[f][j][o] = NM_o  # 记录可用机器数
+    opmax = max(op_list) if op_list else 5
+    # 确保数组维度正确
+    if opmax > time.shape[2]:
+        # 动态扩展 time 和 NM, M
+        new_time = np.zeros((F, N, opmax, TM, 3), dtype=int)
+        new_NM = np.zeros((F, N, opmax), dtype=int)
+        new_M = np.zeros((F, N, opmax, TM), dtype=int)
+        new_time[:F, :N, :min(opmax, time.shape[2]), :TM, :] = time
+        new_NM[:F, :N, :min(opmax, NM.shape[2])] = NM
+        new_M[:F, :N, :min(opmax, M.shape[2]), :TM] = M
+        time, NM, M = new_time, new_NM, new_M
+    SH = sum(H)  # 总工序数
     return N, F, TM, H, SH, NM, M, time, ProF
 
-def initial(N,H,SH,NM,M,ps,F):
-    #create operation sequence and machine selection vectors
-    p_chrom=np.zeros(shape=(ps,SH),dtype=int) #操作序列
-    m_chrom = np.zeros(shape=(ps, SH),dtype=int) #机器选择
-    f_chrom = np.zeros(shape=(ps, N), dtype=int) #工厂分配
-    #临时变量
-    chrom=np.zeros(SH,dtype=int) #用于生成操作序列
-    FC = np.zeros(N, dtype=int) #用于生成工厂分配
-    #生成随机操作序列
-    for i in range(N): #为每个任务的操作生成编号，填充到 chrom 中
+def initial(N, H, SH, NM, M, ps, F):
+    p_chrom = np.zeros(shape=(ps, SH), dtype=int)
+    m_chrom = np.zeros(shape=(ps, SH), dtype=int)
+    f_chrom = np.zeros(shape=(ps, N), dtype=int)
+    chrom = np.zeros(SH, dtype=int)
+    FC = np.zeros(N, dtype=int)
+    for i in range(N):
         for j in range(int(H[i])):
-            k=0
-            for t in range(i-1):
-                k=k+H[t]
-            k=int(k+j)
-            chrom[k]=i
-        FC[i]=i%F #为每个任务分配工厂编号，使用模运算确保工厂编号在 [0, F-1] 范围内
-
-    tmp=chrom;tmp2=FC
-    random.shuffle(tmp) #随机打乱操作序列和工厂分配，生成初始种群
+            k = int(sum(H[:i]) + j)
+            chrom[k] = i
+        FC[i] = i % F
+    tmp = chrom
+    tmp2 = FC
+    random.shuffle(tmp)
     random.shuffle(tmp2)
-    p_chrom[0,:]=tmp
-    f_chrom[0,:]=tmp2
-
-    for i in range(1,ps):
-        tmp=p_chrom[i-1,:] #将上一行的操作序列（p_chrom[i-1, :]）复制到临时变量 tmp 中
+    p_chrom[0, :] = tmp
+    f_chrom[0, :] = tmp2
+    for i in range(1, ps):
+        tmp = p_chrom[i-1, :].copy()
         random.shuffle(tmp)
-        p_chrom[i,:]=tmp
-        tmp2 = f_chrom[i - 1, :]
+        p_chrom[i, :] = tmp
+        tmp2 = f_chrom[i-1, :].copy()
         random.shuffle(tmp2)
         f_chrom[i, :] = tmp2
-    #finish generate operation sequencing sizeing ps
-
-    #开始生成机器选择向量
     for k in range(ps):
         for i in range(N):
-            curf = f_chrom[k,i]
+            curf = f_chrom[k, i]
             for j in range(int(H[i])):
-                #为每个操作随机选择一台机器，并填充到 m_chrom 中
-                t=int(math.floor(random.random()*NM[i][j]))
-                k1 = 0
-                for t2 in range(i):
-                    k1 = k1 + H[t2]
-                t1=int(k1+j)
-                m_chrom[k,t1]=M[curf][i][j][t]-1#adjust the index from 0 to TM-1 to suit time
-    return p_chrom,m_chrom,f_chrom
+                t = int(math.floor(random.random() * NM[curf][i][j]))
+                k1 = int(sum(H[:i]))
+                t1 = int(k1 + j)
+                m_chrom[k, t1] = M[curf][i][j][t] - 1
+    return p_chrom, m_chrom, f_chrom
 
 def RFA(subps,N,F): #随机分配工厂编号
     f_chrom = np.zeros(shape=(subps, N), dtype=int) #subps:子种群大小
@@ -188,33 +169,32 @@ def MinPTF(subps,N,F,ProF): #最小处理时间工厂分配
         f_chrom[k,:]=copy.copy(Fchrom); #将工厂分配结果填充到染色体中
     return f_chrom
 
-def MinPTM(f_chrom,subps,N,H,SH,NM,time,TM,M): #最小处理时间机器选择
-    m_chrom=np.zeros((subps,SH),dtype=int)
+def MinPTM(f_chrom, subps, N, H, SH, NM, time, TM, M):
+    m_chrom = np.zeros((subps, SH), dtype=int)
     for k in range(subps):
         for i in range(N):
-            curf=f_chrom[k][i]
+            curf = f_chrom[k][i]
             for j in range(int(H[i])):
                 t1 = i
                 t2 = j
-                t4 = 0
-                for kk in range(t1):  # sum from 0 to t1-1
-                    t4 = t4 + H[kk]
+                t4 = int(sum(H[:t1]))
                 mp = t4 + t2
-                index=M[curf][i][j][0] - 1
+                index = M[curf][i][j][0] - 1
                 z = time[curf][i][j][index]
-                eta_z = (z[0]+2*z[1]+z[2])/4
+                eta_z = (z[0] + 2 * z[1] + z[2]) / 4
                 NM1 = int(NM[curf][i][j])
                 for t in range(NM1):
-                    d = M[curf][i][j][t]-1 #为每个操作选择处理时间最小的机器
+                    d = M[curf][i][j][t] - 1
                     z_t = time[curf][i][j][d]
-                    eta_t = (z_t[0]+2*z_t[1]+z_t[2])/4
+                    eta_t = (z_t[0] + 2 * z_t[1] + z_t[2]) / 4
                     if eta_z > eta_t or (eta_z == eta_t and z[1] > z_t[1]):
                         eta_z = eta_t
                         index = d
-                m_chrom[k][mp]=index
+                m_chrom[k][mp] = index
     return m_chrom
 
-def MinFTM(p_chrom,f_chrom,subps,N,H,SH,NM,time,TM,M,F): #最小完成时间机器选择
+
+def MinFTM(p_chrom, f_chrom, subps, N, H, SH, NM, time, TM, M, F):
     opmax = int(max(H))
     m_chrom = np.zeros((subps, SH), dtype=int)
     for k in range(subps):
@@ -222,55 +202,38 @@ def MinFTM(p_chrom,f_chrom,subps,N,H,SH,NM,time,TM,M,F): #最小完成时间机�
         s2 = np.zeros(SH, dtype=int)
         p = np.zeros(N, dtype=int)
         for i in range(SH):
-            p[s1[i]] = p[s1[i]] + 1
+            p[s1[i]] += 1
             s2[i] = p[s1[i]]
         P = [[] for _ in range(F)]
-        # assign the machine to each operation from machine selection vector
         for i in range(SH):
             t1 = s1[i]
             t3 = f_chrom[k][t1]
             P[t3].append(p_chrom[k][i])
-
         for f in range(F):
-            mt = np.zeros((TM, 3))  # Store fuzzy load as (a, b, c)
+            mt = np.zeros((TM, 3))  # 模糊负载 [l, m, u]
             SH1 = len(P[f])
-            mm = np.zeros(SH, dtype=int)
+            mm = np.zeros(SH1, dtype=int)
             s3 = copy.copy(P[f])
             s4 = np.zeros(SH1, dtype=int)
             p = np.zeros(N, dtype=int)
-            finish = np.zeros((N, opmax, 3))  # Store fuzzy finish times
-
+            finish = np.zeros((N, opmax, 3))
             for i in range(SH1):
-                p[s3[i]] = p[s3[i]] + 1
+                p[s3[i]] += 1
                 s4[i] = p[s3[i]]
-
             for i in range(SH1):
                 t1 = s3[i]
                 t2 = s4[i] - 1
-                MachineIndex = FindMinFinishTimeMachine(t1, t2, mt[:, 1], TM, N, M[f], NM[f])  # Use middle value for comparison
+                MachineIndex = FindMinFinishTimeMachine(t1, t2, mt[:, 1], TM, N, M[f], NM[f])
                 MinPT = FindMinProcessTimeMachine(t1, t2, MachineIndex, f, time, M[f])
-                try:
-                    mm[i] = MinPT
-                except:
-                    mm[i] = MinPT[0]
+                mm[i] = MinPT if isinstance(MinPT, int) else MinPT[0]
                 z = time[f][t1][t2][mm[i]]
-                # Fuzzy addition for mt
-                mt[mm[i]] = [mt[mm[i]][0] + z[0], mt[mm[i]][1] + z[1], mt[mm[i]][2] + z[2]]
-                # Fuzzy addition for finish
-                finish[t1][t2] = [finish[t1][t2][0] + z[0], finish[t1][t2][1] + z[1], finish[t1][t2][2] + z[2]]
-                if s4[i] > 1:
-                    prev_finish = finish[t1][t2 - 1]
-                    if (mt[mm[i]][0] < prev_finish[0] or mt[mm[i]][1] < prev_finish[1] or mt[mm[i]][2] < prev_finish[2]):
-                        mt[mm[i]] = [prev_finish[0] + z[0], prev_finish[1] + z[1], prev_finish[2] + z[2]]
-
-            for i in range(SH1):
-                t1 = s3[i]
-                t2 = s4[i]
-                t4 = 0
-                for kk in range(t1):  # sum from 0 to t1-1
-                    t4 = t4 + H[kk]
-                mp = t4 + t2 - 1
-                m_chrom[k][mp] = mm[i]
+                prev_finish = finish[t1][t2 - 1] if s4[i] > 1 else [0, 0, 0]
+                machine_available = mt[mm[i]]
+                start = [max(prev_finish[0], machine_available[0]),
+                         max(prev_finish[1], machine_available[1]),
+                         max(prev_finish[2], machine_available[2])]
+                finish[t1][t2] = [start[0] + z[0], start[1] + z[1], start[2] + z[2]]
+                mt[mm[i]] = finish[t1][t2]
     return m_chrom
 
 def MinWLM(p_chrom,f_chrom,subps,N,H,SH,NM,time,TM,M,F): #最小工作负载机器选择
@@ -366,32 +329,26 @@ def selectMachine(mt):#输入机器负载向量 返回最小的机器负载 索�
             candidateM.append(i)
     return candidateM
 
-def FindMinFinishTimeMachine(JobIndex, OperationIndex, mt,TM,N,M,NM):
-    L=NM[JobIndex][OperationIndex]
-    CandidateM = np.zeros(L,dtype=int);
+def FindMinFinishTimeMachine(JobIndex, OperationIndex, mt, TM, N, M, NM):
+    L = NM[JobIndex][OperationIndex]
+    CandidateM = np.zeros(L, dtype=int)
     for i in range(L):
-        CandidateM[i] = M[JobIndex][OperationIndex][i]-1;
-    if L<2:
-        ProtenialMachine = CandidateM
-        return ProtenialMachine
-    ProtenialMachine=[]
-    MinFinishMIndex = CandidateM[0];
-    ProtenialMachine.append(MinFinishMIndex)
-    for j in range(1,L):
-        if mt[MinFinishMIndex] == mt[CandidateM[j]]:
-            ProtenialMachine.append(CandidateM[j])
-        else:
-            if mt[MinFinishMIndex] > mt[CandidateM[j]]:
-                ProtenialMachine = [];
-                MinFinishMIndex = CandidateM[j];
-                ProtenialMachine.append(MinFinishMIndex)
-    return ProtenialMachine
+        CandidateM[i] = M[JobIndex][OperationIndex][i] - 1
+    if L < 2:
+        return CandidateM[0]  # 返回单一机器
+    MinFinishMIndex = CandidateM[0]
+    eta_min = (mt[MinFinishMIndex][0] + 2 * mt[MinFinishMIndex][1] + mt[MinFinishMIndex][2]) / 4
+    for j in range(1, L):
+        eta_j = (mt[CandidateM[j]][0] + 2 * mt[CandidateM[j]][1] + mt[CandidateM[j]][2]) / 4
+        if eta_min > eta_j:
+            MinFinishMIndex = CandidateM[j]
+            eta_min = eta_j
+    return MinFinishMIndex
 
 def FindMinProcessTimeMachine(JobIndex, OperationIndex, MachineIndex, f_index, time, M):
     L = len(MachineIndex)
     if L < 2:
-        MinProcessTimeMachine = MachineIndex
-        return MinProcessTimeMachine
+        return MachineIndex[0]
     MinProcessTimeMachine = MachineIndex[0]
     z = time[f_index][JobIndex][OperationIndex][MinProcessTimeMachine]
     eta_z = (z[0] + 2 * z[1] + z[2]) / 4
@@ -453,38 +410,103 @@ def GHInitial(N,H,SH,NM,M,TM,time,F,ProF,ps): #结合多种启发式方法初始
         f_chrom[low: up,:]=copy.copy(subfchrom);
     return p_chrom,m_chrom,f_chrom
 
-def CalfitDHFJFP(p_chrom,m_chrom,f_chrom,N,H,SH,F,TM,time): #计算多个工厂的适应度
+def CalfitDHFJFP(p_chrom, m_chrom, f_chrom, N, H, SH, F, TM, time):
     s1 = p_chrom
     s2 = np.zeros(SH, dtype=int)
     p = np.zeros(N, dtype=int)
-    fitness = np.zeros(3)
     for i in range(SH):
-        p[s1[i]] = p[s1[i]] + 1
+        p[s1[i]] += 1
         s2[i] = p[s1[i]]
     P = [[] for _ in range(F)]
     FJ = [[] for _ in range(F)]
-
     for i in range(SH):
-        t1=s1[i]
-        t2=s2[i]
-        t3=f_chrom[t1]
-        P[t3].append(p_chrom[i])
+        t1 = s1[i]
+        t3 = f_chrom[t1]
+        P[t3].append(s1[i])  # 注意 P[f] 存储任务 ID，而非 p_chrom[i]
     for i in range(N):
-        t3=f_chrom[i]
+        t3 = f_chrom[i]
         FJ[t3].append(i)
-    sub_f_fit=np.zeros(shape=(F,2))
-
+    sub_f_fit = np.zeros((F, 2))  # 每个工厂的 [makespan eta, energy eta]
     for f in range(F):
-        sub_f_fit[f][0],sub_f_fit[f][1]=CalfitFJFP(P[f],m_chrom,FJ[f],f,N,H,TM,time)
-
-    fit1=sub_f_fit[0][0]
-    fit3=0;fit2=0
+        if len(P[f]) > 0:  # 避免空工厂
+            sub_f_fit[f][0], sub_f_fit[f][1] = CalfitFJFP(P[f], m_chrom, FJ[f], f, N, H, TM, time)
+    fit1 = 0  # 最大完成时间 eta
+    fit2 = 0  # 总能量消耗 eta
+    fit3 = 0  # 完成时间最长的工厂索引
     for f in range(F):
-        fit2=sub_f_fit[f][1]+fit2
-        if fit1<sub_f_fit[f][0]:
-            fit1=sub_f_fit[f][0]
-            fit3=f
-    return fit1,fit2,fit3 # 最大完成时间、总能量消耗、完成时间最长的工厂索引
+        fit2 += sub_f_fit[f][1]
+        if sub_f_fit[f][0] > fit1:
+            fit1 = sub_f_fit[f][0]
+            fit3 = f
+    return fit1, fit2, fit3  # 最大完成时间 eta、总能量消耗 eta、完成时间最长的工厂索引
+
+def CalfitFJFP(p_chrom, m_chrom, FJ, f_index, N, H, TM, time):
+    SH = len(p_chrom)  # 总操作数量
+    Ep = 4; Es = 1  # 运行功率与空闲功率
+    opmax = int(max(H))
+    # 初始化完成时间矩阵用于记录每个操作的完成时间
+    finish = np.zeros((N, opmax, 3))
+    # machine finish time
+    mt = np.zeros((TM, 3))
+    # sign all operation
+    s1 = p_chrom
+    s2 = np.zeros(SH, dtype=int)  # 操作队列
+    p = np.zeros(N, dtype=int)  # 任务计数
+    fitness = np.zeros(2)
+    for i in range(SH):  # 计算每个任务的操作计数
+        p[s1[i]] = p[s1[i]] + 1
+        s2[i] = p[s1[i]]
+    # assign the machine to each operation from machine selection vector
+    mm = np.zeros(SH, dtype=int)
+    for i in range(SH):
+        t1 = s1[i]
+        t2 = s2[i]
+        t4 = 0
+        for k in range(t1):  # sum from 0 to t1-1
+            t4 = t4 + H[k]
+        mm[i] = m_chrom[t4 + t2 - 1]
+    # 初始化工作载荷与待机时间
+    TWL = np.zeros(3)
+    TIT = np.zeros(3)  # 计算每个操作的完成时间、总工作负载（TWL）和总空闲时间（TIT）
+    # start decoding
+    for i in range(SH):
+        # because array index starts with 0 in python, number in M start from 1,
+        # number in time start from 0, thus number of m_chrom need to minus 1
+        t1 = s1[i]
+        t2 = s2[i] - 1
+        t3 = mm[i]
+        z = time[f_index][t1][t2][t3]
+        if s2[i] == 1:  # 第一个操作 (注意 s2[i]==1 而非0，索引调整)
+            mt[t3] = [mt[t3][0] + z[0], mt[t3][1] + z[1], mt[t3][2] + z[2]]
+            finish[t1][t2] = mt[t3].copy()
+            TWL = [TWL[0] + z[0], TWL[1] + z[1], TWL[2] + z[2]]
+        else:
+            prev_finish = finish[t1][t2 - 1]
+            machine_available = mt[t3]
+            # idle_time = max(0, prev_finish - machine_available) 分量处理
+            idle_time = [max(0, prev_finish[0] - machine_available[0]),
+                         max(0, prev_finish[1] - machine_available[1]),
+                         max(0, prev_finish[2] - machine_available[2])]
+            TIT = [TIT[0] + idle_time[0], TIT[1] + idle_time[1], TIT[2] + idle_time[2]]
+            # start = max(prev_finish, machine_available)
+            start = [max(prev_finish[0], machine_available[0]),
+                     max(prev_finish[1], machine_available[1]),
+                     max(prev_finish[2], machine_available[2])]
+            mt[t3] = [start[0] + z[0], start[1] + z[1], start[2] + z[2]]
+            finish[t1][t2] = mt[t3].copy()
+            TWL = [TWL[0] + z[0], TWL[1] + z[1], TWL[2] + z[2]]
+    # 计算 max makespan eta
+    max_eta = (mt[0][0] + 2 * mt[0][1] + mt[0][2]) / 4
+    for i in range(1, TM):
+        eta = (mt[i][0] + 2 * mt[i][1] + mt[i][2]) / 4
+        if eta > max_eta:
+            max_eta = eta
+    fitness[0] = max_eta
+    # 计算能量消耗 eta
+    eta_TWL = (TWL[0] + 2 * TWL[1] + TWL[2]) / 4
+    eta_TIT = (TIT[0] + 2 * TIT[1] + TIT[2]) / 4
+    fitness[1] = eta_TWL * Ep + eta_TIT * Es
+    return fitness[0], fitness[1]  # 最大完成时间 eta、能量消耗 eta
 
 def SwapOF(p_chrom, m_chrom, f_chrom, fitness, N, H, SH, time):
     Index1 = np.floor(random.random() * SH)
@@ -770,104 +792,7 @@ def N6(p_chrom, m_chrom, f_chrom, fitness, N, H, SH, time, TM, NM, M, F):
             newp[IP[f][i]] = P[f][i]
     return newp, newm, newf
 
-# coding:utf-8
-import numpy as np
 
-def CalfitFJFP(p_chrom,m_chrom,FJ,f_index,N,H,TM,time):
-    #计算运行消耗与待机消耗
-    SH=len(p_chrom) #总操作数量
-    Ep=4;Es=1 #运行功率与空闲功率
-    opmax=int(max(H))
-    #初始化完成时间矩阵用于记录每个操作的完成时间
-    finish=np.zeros(shape=(N,opmax,3))
-    #machine finish time
-    mt=np.zeros((TM,3))
-    #sign all operation
-    s1=p_chrom
-    s2=np.zeros(SH,dtype=int) #操作队列
-    p=np.zeros(N,dtype=int) #任务计数
-    fitness=np.zeros(2)
-    for i in range(SH): #计算每个任务的操作计数
-        p[s1[i]]=p[s1[i]]+1
-        s2[i]=p[s1[i]]
-    #assign the machine to each operation from machine selection vector
-    mm=np.zeros(SH,dtype=int)
-    for i in range(SH):
-        t1=s1[i]
-        t2=s2[i]
-        t4=0
-        for k in range(t1):#sum from 0 to t1-1
-            t4=t4+H[k]
-        mm[i]=m_chrom[t4+t2-1]
-    #初始化工作载荷与待机时间
-    TWL=np.zeros(3);
-    TIT=np.zeros(3); #计算每个操作的完成时间、总工作负载（TWL）和总空闲时间（TIT）
-    #start decoding
-    for i in range(SH):
-        # because array index starts with 0 in python, number in M start from 1,
-        # number in time start from 0, thus number of m_chrom need to miner 1
-        t1=s1[i]
-        t2=s2[i]-1
-        t3=mm[i]
-        z = time[f_index][t1][t2][t3]
-        if s2[i]==0:
-            mt[t3]=[mt[t3][0]+z[0],mt[t3][1]+z[1],mt[t3][2]+z[2]]
-            finish[t1][t2] = mt[t3]
-            TWL = [TWL[0]+z[0],TWL[1]+z[1],TWL[2]+z[2]]
-        else:
-            if (mt[t3][0]<finish[t1][t2-1][0] or mt[t3][1]<finish[t1][t2-1][1] or mt[t3][2]<finish[t1][t2-1][2]):
-                idle_time = [finish[t1][t2 - 1][0] - mt[t3][0], finish[t1][t2 - 1][1] - mt[t3][1],finish[t1][t2 - 1][2] - mt[t3][2]]
-                TIT = [TIT[0] + idle_time[0], TIT[1] + idle_time[1], TIT[2] + idle_time[2]]
-                mt[t3] = [finish[t1][t2 - 1][0] + z[0], finish[t1][t2 - 1][1] + z[1], finish[t1][t2 - 1][2] + z[2]]
-                finish[t1][t2] = mt[t3]
-                TWL = [TWL[0] + z[0], TWL[1] + z[1], TWL[2] + z[2]]
-            else:
-                mt[t3] = [mt[t3][0] + z[0], mt[t3][1] + z[1], mt[t3][2] + z[2]]
-                finish[t1][t2] = mt[t3]
-                TWL = [TWL[0] + z[0], TWL[1] + z[1], TWL[2] + z[2]]
-    fitness[0] = (mt[0][0] + 2 * mt[0][1] + mt[0][2]) / 4  # 使用 eta 计算
-    for i in range(1,TM):
-        eta = (mt[i][0] + 2 * mt[i][1] + mt[i][2]) / 4
-        if eta>fitness[0]:
-            fitness[0]=eta
-    eta_TWL = (TWL[0] + 2 * TWL[1] + TWL[2]) / 4
-    eta_TIT = (TIT[0] + 2 * TIT[1] + TIT[2]) / 4
-    fitness[1] = eta_TWL * Ep + eta_TIT * Es
-    #print(fitness[0],fitness[1],TWL,TIT)
-    return fitness[0],fitness[1] #最大完成时间、能量消耗
-
-def CalfitDHFJFP(p_chrom,m_chrom,f_chrom,N,H,SH,F,TM,time): #计算多个工厂的适应度
-    s1 = p_chrom
-    s2 = np.zeros(SH, dtype=int)
-    p = np.zeros(N, dtype=int)
-    fitness = np.zeros(3)
-    for i in range(SH):
-        p[s1[i]] = p[s1[i]] + 1
-        s2[i] = p[s1[i]]
-    P = [[] for _ in range(F)]
-    FJ = [[] for _ in range(F)]
-
-    for i in range(SH):
-        t1=s1[i]
-        t2=s2[i]
-        t3=f_chrom[t1]
-        P[t3].append(p_chrom[i])
-    for i in range(N):
-        t3=f_chrom[i]
-        FJ[t3].append(i)
-    sub_f_fit=np.zeros(shape=(F,2))
-
-    for f in range(F):
-        sub_f_fit[f][0],sub_f_fit[f][1]=CalfitFJFP(P[f],m_chrom,FJ[f],f,N,H,TM,time)
-
-    fit1=sub_f_fit[0][0]
-    fit3=0;fit2=0
-    for f in range(F):
-        fit2=sub_f_fit[f][1]+fit2
-        if fit1<sub_f_fit[f][0]:
-            fit1=sub_f_fit[f][0]
-            fit3=f
-    return fit1,fit2,fit3 # 最大完成时间、总能量消耗、完成时间最长的工厂索引
 
 class Net(nn.Module, ABC):
     def __init__(self, inDim, outDim):
@@ -964,34 +889,34 @@ class DQN(object):
         self.optimizer.step()
         return losses
 
-def tournamentSelection(p_chrom,m_chrom,f_chrom,fitness,ps,SH,N):
-    #锦标赛选择：通过随机选择两个个体进行比较，选择适应度较高的个体进入交配池
-    #初始化交配池
-    pool_size=ps
+def tournamentSelection(p_chrom, m_chrom, f_chrom, fitness, ps, SH, N):
+    # 锦标赛选择：通过随机选择两个个体进行比较，选择适应度较高的个体进入交配池
+    # 初始化交配池
+    pool_size = ps
     P_pool = np.zeros(shape=(ps, SH), dtype=int)
     M_pool = np.zeros(shape=(ps, SH), dtype=int)
-    F_pool = np.zeros(shape=(ps, N), dtype=int) #fitness of pool solutions
-    # compeitor number
-    tour=2
+    F_pool = np.zeros(shape=(ps, N), dtype=int)  # fitness of pool solutions
+    # competitor number
+    tour = 2
 
     # 随机从池子里选择两个个体
     for i in range(pool_size):
         index1 = int(math.floor(random.random() * ps))
         index2 = int(math.floor(random.random() * ps))
-        while index1==index2:
+        while index1 == index2:
             index2 = int(math.floor(random.random() * ps))
-        f1=fitness[index1,0:2]
-        f2=fitness[index2,0:2]
-        #使用NDS（非支配排序）计算两个个体适应度并比较
-        if (NDS(f1, f2) == 1): #选个体index1
-            P_pool[i,:]=p_chrom[index1,:]
-            M_pool[i,:]=m_chrom[index1,:]
-            F_pool[i,:]=f_chrom[index1,:]
-        elif(NDS(f1, f2) == 2): #选择个体index2
+        f1 = fitness[index1, 0:2]  # [makespan eta, energy eta]
+        f2 = fitness[index2, 0:2]  # [makespan eta, energy eta]
+        # 使用 NDS（非支配排序）计算两个个体适应度并比较
+        if (NDS(f1, f2) == 1):  # 选个体 index1
+            P_pool[i, :] = p_chrom[index1, :]
+            M_pool[i, :] = m_chrom[index1, :]
+            F_pool[i, :] = f_chrom[index1, :]
+        elif (NDS(f1, f2) == 2):  # 选择个体 index2
             P_pool[i, :] = p_chrom[index2, :]
             M_pool[i, :] = m_chrom[index2, :]
             F_pool[i, :] = f_chrom[index2, :]
-        else: #无法区分优劣，随机选择一个放入交配池
+        else:  # 无法区分优劣，随机选择一个放入交配池
             if random.random() <= 0.5:
                 P_pool[i, :] = p_chrom[index1, :]
                 M_pool[i, :] = m_chrom[index1, :]
@@ -1000,133 +925,194 @@ def tournamentSelection(p_chrom,m_chrom,f_chrom,fitness,ps,SH,N):
                 P_pool[i, :] = p_chrom[index2, :]
                 M_pool[i, :] = m_chrom[index2, :]
                 F_pool[i, :] = f_chrom[index2, :]
-    return P_pool,M_pool,F_pool
 
-def crossover(P1,M1,F1,P2,M2,F2,N,SH): #交叉操作
-    #两个父代P1 P2生成两个子代ci1 ci2，选择一部分操作J1，P1是保留J1中的操作，而P2则是保留非J1中的操作
-    #初始化子代，复制父代个体作为子代初始值
-    NP1=P1;NM1=M1
-    NP2=P2;NM2=M2
-    NF1=F1;NF2=F2
-    #初始化P1与P2中的索引
-    ci1 = np.zeros(SH,dtype=int)
+    print(f"i={i}, index1={index1}, index2={index2}")
+    print(f"f1={f1}, f2={f2}, f1 shape={f1.shape}")
+    return P_pool, M_pool, F_pool
+
+def crossover(P1, M1, F1, P2, M2, F2, N, SH, F):
+    # 初始化子代，复制父代个体作为子代初始值
+    NP1 = P1.copy()
+    NM1 = M1.copy()
+    NF1 = F1.copy()
+    NP2 = P2.copy()
+    NM2 = M2.copy()
+    NF2 = F2.copy()
+
+    # 随机选择一部分任务 J1
+    temp = [random.random() for _ in range(N)]
+    temp = mylistRound(temp)  # 假设将随机数四舍五入到 0 或 1
+    J1 = find_all_index(temp, 1)  # 找到值为 1 的任务索引
+
+    # 初始化 ci1 和 ci2
+    ci1 = np.zeros(SH, dtype=int)
     ci2 = np.zeros(SH, dtype=int)
-    # 随机选择一部分任务J1
-    temp=[random.random() for _ in range(N) ]
-    temp=mylistRound(temp)
-    J1=find_all_index(temp,1)#find the index where value equal to 1
+
+    # 填充 ci1 和 ci2 的初始部分
     for j in range(SH):
-        if Ismemeber(P1[j], J1)==1: #if is in job set J
-            ci1[j] = P1[j]+1
+        if Ismemeber(P1[j], J1) == 1:  # P1 保留 J1 中的操作
+            ci1[j] = P1[j]
+        if Ismemeber(P2[j], J1) == 0:  # P2 保留非 J1 中的操作
+            ci2[j] = P2[j]
 
-        if Ismemeber(P2[j], J1)==0: #if is not in job set J
-            ci2[j] = P2[j]+1
-    index_1_1 = find_all_index(ci1,0) # find the empty positions in ci1
-    index_1_2 = find_all_index_not(ci2,0) # find the positions in ci2 which is not zero
+    # 找到空位和非空位
+    index_1_1 = find_all_index(ci1, 0)  # ci1 中的空位
+    index_1_2 = find_all_index_not(ci2, 0)  # ci2 中的非空位
+    index_2_1 = find_all_index(ci2, 0)  # ci2 中的空位
+    index_2_2 = find_all_index_not(ci1, 0)  # ci1 中的非空位
 
-    index_2_1 = find_all_index(ci2,0)
-    index_2_2 = find_all_index_not(ci1,0)
-    l1=len(index_1_1);l2=len(index_2_1)
-    for j in range(l1):
-        ci1[index_1_1[j]] = NP2[index_1_2[j]]
-    for j in range(l2):
-        ci2[index_2_1[j]] = NP1[index_2_2[j]]
-    l1 = len(index_2_2);l2 = len(index_1_2)
-    for j in range(l1):
-        ci1[index_2_2[j]] = ci1[index_2_2[j]]-1
-    for j in range(l2):
-        ci2[index_1_2[j]] = ci2[index_1_2[j]] - 1
-    NP1=ci1
+    l1 = len(index_1_1)
+    l2 = len(index_2_1)
+    if l1 == len(index_1_2) and l2 == len(index_2_2):  # 确保长度匹配
+        for j in range(l1):
+            ci1[index_1_1[j]] = P2[index_1_2[j]]  # 填充 ci1 的空位
+        for j in range(l2):
+            ci2[index_2_1[j]] = P1[index_2_2[j]]  # 填充 ci2 的空位
+
+    # 更新 NP1 和 NP2
+    NP1 = ci1
     NP2 = ci2
 
-    # 对机器选择运用通用交叉：随机选择两个父代各自一半的机器选择交换
+    # 对机器选择运用通用交叉
     s = [random.random() for _ in range(SH)]
     s = mylistRound(s)
-    for i in range(0,SH):
-        if (s[i] == 1):
-            t = NM1[i]
-            NM1[i] = NM2[i];
-            NM2[i] = t;
-    # 对工厂分配运用通用交叉：随机选择两个父代各自一半的工厂分配交换
+    for i in range(SH):
+        if s[i] == 1:
+            NM1[i], NM2[i] = NM2[i], NM1[i]  # 交换机器选择
+
+    # 对工厂分配运用通用交叉
     s = [random.random() for _ in range(N)]
     s = mylistRound(s)
-    for i in range(0, N):
-        if (s[i] == 1):
+    for i in range(N):
+        if s[i] == 1:
             t = NF1[i]
-            NF1[i] = NF2[i];
-            NF2[i] = t;
-    return NP1,NM1,NF1,NP2,NM2,NF2
+            NF1[i] = NF2[i]
+            NF2[i] = t
+            if NF1[i] >= F or NF2[i] >= F:  # 边界检查
+                NF1[i] = NF1[i] % F
+                NF2[i] = NF2[i] % F
 
-def mutation(p_chrom,m_chrom,SH,N,H,NM,M): #变异操作
-    #随机交换操作序列中的两个位置
-    p1 = math.floor(random.random() * SH)
-    p2 = math.floor(random.random() * SH)
-    while p1==p2:
-        p2 = math.floor(random.random() * SH)
-    t = p_chrom[p1]
-    p_chrom[p1] = p_chrom[p2]
-    p_chrom[p2] = t;
+    return NP1, NM1, NF1, NP2, NM2, NF2
 
-    #随机改变机器选择中的两个位置
-    s1 = p_chrom
-    s2 = np.zeros(SH, dtype=int)
-    p = np.zeros(N, dtype=int)
-    fitness = np.zeros(2)
-    for i in range(SH):
-        p[s1[i]] = p[s1[i]] + 1
-        s2[i] = p[s1[i]]
-    s3=m_chrom
-    #计算每个任务的操作计数
+def mutation(p_chrom, m_chrom, SH, N, H, NM, M, f_chrom):
+    # 随机交换操作序列中的两个位置
     p1 = math.floor(random.random() * SH)
     p2 = math.floor(random.random() * SH)
     while p1 == p2:
         p2 = math.floor(random.random() * SH)
-    #print('Job= ',s1[p1],'Op= ',s2[p1]-1,'MaxOp=',H[s1[p1]])
-    # 获取可用机器数量和随机选择一台新机器
-    n = NM[s1[p1]][s2[p1]-1]
-    m = math.floor(random.random() * n)
-    x = M[s1[p1]][s2[p1]-1][m]-1
-    #确保新机器与原机器不同
-    if n>1:
-        while s3[p1]==x:
-            m = math.floor(random.random() * n)
-            x = M[s1[p1]][s2[p1]-1][m]-1
-    k1 = 0
-    for t2 in range(s1[p1]):#sum from 0 to s1[p1]
-        k1 = k1 + H[t2]
-    t1 = int(k1 + s2[p1]-1)
-    m_chrom[t1] = x
+    t = p_chrom[p1]
+    p_chrom[p1] = p_chrom[p2]
+    p_chrom[p2] = t
 
-    n = NM[s1[p2]][s2[p2] - 1]
-    m = math.floor(random.random() * n)
-    x = M[s1[p2]][s2[p2] - 1][m]-1
-    if n > 1:
-        while s3[p2] == x:
-            m = math.floor(random.random() * n)
-            x = M[s1[p2]][s2[p2] - 1][m]-1
-    k1 = 0
-    for t2 in range(s1[p2]):#sum from 0 to s1[p2]
-        k1 = k1 + H[t2]
-    t1 = int(k1 + s2[p2] - 1)
-    m_chrom[t1] = x
-    return p_chrom,m_chrom
+    # 随机改变机器选择中的两个位置
+    s1 = p_chrom
+    s2 = np.zeros(SH, dtype=int)
+    p = np.zeros(N, dtype=int)
+    for i in range(SH):
+        if s1[i] < N:  # 确保作业号有效
+            p[s1[i]] = p[s1[i]] + 1
+            s2[i] = p[s1[i]]
+    s3 = m_chrom
 
-def evolution(p_chrom,m_chrom,f_chrom,index,Pc,Pm,ps,SH,N,H,NM,M): #整个种群中随机选择两个个体交叉变异
-    R = math.floor(random.random() * ps) #随机选择一个个体与当前个体index交叉变异
-    P1=copy.copy(p_chrom[index,:])
-    P2 = copy.copy(p_chrom[R,:])
-    M1=copy.copy(m_chrom[index,:])
-    M2 = copy.copy(m_chrom[R,:])
-    F1=copy.copy(f_chrom[index,:])
-    F2 = copy.copy(f_chrom[R,:])
-    while R == index:
-        R = math.floor(random.random() * ps)
-    if random.random()<Pc: #随机数小于交叉概率交叉
-        P1,M1,F1,P2,M2,F2=crossover(p_chrom[index,:],m_chrom[index,:],f_chrom[index,:],p_chrom[R,:],m_chrom[R,:],f_chrom[R,:],N,SH)
-    if random.random()<Pm: #随机数小于变异概率变异
-        P1,M1=mutation(P1,M1,SH,N,H,NM,M)
-        P2, M2 = mutation(P2, M2, SH, N, H, NM, M)
-    return P1,M1,F1,P2,M2,F2
+    # 变异两个随机位置
+    p1 = math.floor(random.random() * SH)
+    p2 = math.floor(random.random() * SH)
+    while p1 == p2:
+        p2 = math.floor(random.random() * SH)
+
+    # 第一个变异位置
+    if p1 < SH and s1[p1] < N and s2[p1] - 1 < H[s1[p1]]:  # 边界检查
+        f_idx = f_chrom[s1[p1]]  # 获取工厂号
+        n = NM[f_idx][s1[p1]][s2[p1] - 1]  # 可用机器数
+        if n > 0:
+            m = math.floor(random.random() * n)
+            x = M[f_idx][s1[p1]][s2[p1] - 1][m] - 1  # 新机器号 (0-based)
+            # 确保新机器与原机器不同
+            if n > 1:
+                while s3[p1] == x:
+                    m = math.floor(random.random() * n)
+                    x = M[f_idx][s1[p1]][s2[p1] - 1][m] - 1
+            m_chrom[p1] = x  # 直接更新 m_chrom[p1]
+
+    # 第二个变异位置
+    if p2 < SH and s1[p2] < N and s2[p2] - 1 < H[s1[p2]]:  # 边界检查
+        f_idx = f_chrom[s1[p2]]  # 获取工厂号
+        n = NM[f_idx][s1[p2]][s2[p2] - 1]  # 可用机器数
+        if n > 0:
+            m = math.floor(random.random() * n)
+            x = M[f_idx][s1[p2]][s2[p2] - 1][m] - 1  # 新机器号 (0-based)
+            # 确保新机器与原机器不同
+            if n > 1:
+                while s3[p2] == x:
+                    m = math.floor(random.random() * n)
+                    x = M[f_idx][s1[p2]][s2[p2] - 1][m] - 1
+            m_chrom[p2] = x  # 直接更新 m_chrom[p2]
+
+    return p_chrom, m_chrom
+
+def crossover(P1, M1, F1, P2, M2, F2, N, SH, F):
+    # 初始化子代，复制父代个体作为子代初始值
+    NP1 = P1.copy()
+    NM1 = M1.copy()
+    NF1 = F1.copy()
+    NP2 = P2.copy()
+    NM2 = M2.copy()
+    NF2 = F2.copy()
+
+    # 随机选择一部分任务 J1
+    temp = [random.random() for _ in range(N)]
+    temp = mylistRound(temp)  # 假设将随机数四舍五入到 0 或 1
+    J1 = find_all_index(temp, 1)  # 找到值为 1 的任务索引
+
+    # 初始化 ci1 和 ci2
+    ci1 = np.zeros(SH, dtype=int)
+    ci2 = np.zeros(SH, dtype=int)
+
+    # 填充 ci1 和 ci2 的初始部分
+    for j in range(SH):
+        if Ismemeber(P1[j], J1) == 1:  # P1 保留 J1 中的操作
+            ci1[j] = P1[j]
+        if Ismemeber(P2[j], J1) == 0:  # P2 保留非 J1 中的操作
+            ci2[j] = P2[j]
+
+    # 找到空位和非空位
+    index_1_1 = find_all_index(ci1, 0)  # ci1 中的空位
+    index_1_2 = find_all_index_not(ci2, 0)  # ci2 中的非空位
+    index_2_1 = find_all_index(ci2, 0)  # ci2 中的空位
+    index_2_2 = find_all_index_not(ci1, 0)  # ci1 中的非空位
+
+    l1 = len(index_1_1)
+    l2 = len(index_2_1)
+    if l1 == len(index_1_2) and l2 == len(index_2_2):  # 确保长度匹配
+        for j in range(l1):
+            ci1[index_1_1[j]] = P2[index_1_2[j]]  # 填充 ci1 的空位
+        for j in range(l2):
+            ci2[index_2_1[j]] = P1[index_2_2[j]]  # 填充 ci2 的空位
+
+    # 更新 NP1 和 NP2
+    NP1 = ci1
+    NP2 = ci2
+
+    # 对机器选择运用通用交叉
+    s = [random.random() for _ in range(SH)]
+    s = mylistRound(s)
+    for i in range(SH):
+        if s[i] == 1:
+            NM1[i], NM2[i] = NM2[i], NM1[i]  # 交换机器选择
+
+    # 对工厂分配运用通用交叉
+    s = [random.random() for _ in range(N)]
+    s = mylistRound(s)
+    for i in range(N):
+        if s[i] == 1:
+            t = NF1[i]
+            NF1[i] = NF2[i]
+            NF2[i] = t
+            if NF1[i] >= F or NF2[i] >= F:  # 边界检查
+                NF1[i] = NF1[i] % F
+                NF2[i] = NF2[i] % F
+
+    return NP1, NM1, NF1, NP2, NM2, NF2
 
 def evolution2(p_chrom,m_chrom,f_chrom,index,T,neighbour,Pc,Pm,ps,SH,N,H,NM,M): #邻域选择两个个体交叉变异
     nei=neighbour[index,:] # 一个矩阵，其中每一行表示一个个体的邻域个体索引
@@ -1152,53 +1138,38 @@ def evolution2(p_chrom,m_chrom,f_chrom,index,T,neighbour,Pc,Pm,ps,SH,N,H,NM,M): 
         P2, M2 = mutation(P2, M2, SH, N, H, NM, M)
     return P1,M1,F1,P2,M2,F2
 
-# coding:utf-8
-import numpy as np
-
 def mylistRound(arr):
-    l = len(arr)
-    for i in range(l):
-        arr[i] = round(arr[i])
-    return arr
+    """将随机数数组根据 0.5 阈值二值化，返回新数组。"""
+    return [1 if x > 0.5 else 0 for x in arr]
 
 def find_all_index(arr, item):
-    return [i for i, a in enumerate(arr) if a == item]
-
+    return np.where(np.array(arr) == item)[0].tolist()
 def find_all_index_not(arr, item):
-    l = len(arr)
-    flag = np.zeros(l)
-    index = find_all_index(arr, item)
-    flag[index] = 1
-    not_index = find_all_index(flag, 0)
-    return not_index
+    return np.where(np.array(arr) != item)[0].tolist()
 
 def NDS(fit1, fit2):
-    v = 0
+    # fit1 和 fit2 是 [makespan eta, energy eta] 的数组，形状 (2,)
     dom_less = 0
     dom_equal = 0
     dom_more = 0
-    for k in range(2):
+    for k in range(2):  # 比较 makespan eta 和 energy eta
         if fit1[k] > fit2[k]:
-            dom_more = dom_more + 1
+            dom_more += 1
         elif fit1[k] == fit2[k]:
-            dom_equal = dom_equal + 1
+            dom_equal += 1
         else:
-            dom_less = dom_less + 1
-
+            dom_less += 1
     if dom_less == 0 and dom_equal != 2:
-        v = 2
+        return 2  # fit1 支配 fit2
     if dom_more == 0 and dom_equal != 2:
-        v = 1
-    return v
+        return 1  # fit2 支配 fit1
+    return 0  # 非支配
 
 def Ismemeber(item, list):
-    l = len(list)
-    flag = 0
-    for i in range(l):
-        if list[i] == item:
-            flag = 1
-            break
-    return flag
+    """检查 item 是否在 list 中，返回 1 (在) 或 0 (不在)。"""
+    if not list:  # 空列表检查
+        return 0
+    return 1 if item in list else 0
 
 def DeleteReapt(QP, QM, QF, QFit, ps):
     row = np.size(QFit, 0)
@@ -1747,80 +1718,75 @@ CCF=0
 #十个工件 每个工件需要五步 每个工件五步只能在一个工厂 每步在一个工厂中的不同的机器上时间不同
 
 
-for file in range(CCF,CCF+1):
-    N,F,TM,H,SH,NM,M,time,ProF=DataReadDHFJSP(FileName[file])
+for file in range(CCF, CCF + 1):
+    N, F, TM, H, SH, NM, M, time, ProF = DataReadDHFJSP(FileName[file])
 
-    print(f"NM shape: {NM.shape}")
-    print(f"M shape: {M.shape}")
-    print(f"time shape: {time.shape}")
-    print(f"Sample M[0][0][0]: {M[0][0][0]}")  # 应为 [1 2 3 4 5] 或类似
-    print(f"Sample time[0][0][0][0]: {time[0][0][0][0]}")  # 应为 2
+    print(f"N={N}, F={F}, TM={TM}, H={H}, SH={SH}, time shape={time.shape}")
+    print(f"time[0][0][0]={time[0][0][0]}")  # 打印第一个工序的模糊时间
 
-    # 作业数量 工厂数量 机器时间矩阵 总工序数 每个作业工序数 每个工厂机器数量 总机器数 工序时间表 工厂加工能力矩阵
-    MaxNFEs=200*SH #最大函数评估次数（停止条件）
-    #create filepath to store the pareto solutions set for each independent run
-    respath='DQNV9+ES\\';sprit='\\' # 路径分隔符（Windows系统）
-    respath=respath+ResultPath[file]
-    isExist=os.path.exists(respath)
-    #if the result path has not been created
+    MaxNFEs = 200 * SH  # 最大函数评估次数（停止条件）
+    # create filepath to store the pareto solutions set for each independent run
+    respath = 'DQNV9+ES\\'
+    sprit = '\\'  # 路径分隔符（Windows系统）
+    respath = respath + ResultPath[file]
+    isExist = os.path.exists(respath)
+    # if the result path has not been created
     if not isExist:
-        currentpath=os.getcwd()
-        os.makedirs(currentpath+sprit+respath)
-    print(ResultPath[file],'is being Optimizing\n')
-    #start independent run for GMA
+        currentpath = os.getcwd()
+        os.makedirs(currentpath + sprit + respath)
+    print(ResultPath[file], 'is being Optimizing\n')
+    # start independent run for GMA
     for rround in range(1):
-        p_chrom,m_chrom,f_chrom=initial(N,H,SH,NM,M,ps,F) #初始化种群
+        p_chrom, m_chrom, f_chrom = initial(N, H, SH, NM, M, ps, F)  # 初始化种群
         # p_chrom：作业工序顺序（形状(ps, SH)）。
         # m_chrom：机器分配方案（形状(ps, SH)）。
         # f_chrom：工厂分配方案（形状(ps, N)）。
-        fitness=np.zeros(shape=(ps,3))
+        fitness = np.zeros(shape=(ps, 3))
 
-        #print(f"TM: {TM}")
-        #print(f"m_chrom: {m_chrom}")
-
-        NFEs=0 #number of function evaluation
-        #calucate fitness of each solution
-        for i in range(ps): #计算初始化种群的适应度（完成时间与能量消耗）
-            fitness[i,0],fitness[i,1],fitness[i,2]=CalfitDHFJFP(p_chrom[i,:],m_chrom[i,:],f_chrom[i,:],N,H,SH,F,TM,time)
-        #存储最佳的选择
-        AP=[];AM=[];AF=[];AFit=[]# Elite archive #操作序列、机器选择、工厂分配、适应度
-        i=1
+        NFEs = 0  # number of function evaluation
+        # calucate fitness of each solution
+        for i in range(ps):  # 计算初始化种群的适应度（完成时间与能量消耗）
+            fitness[i, 0], fitness[i, 1], fitness[i, 2] = CalfitDHFJFP(p_chrom[i, :], m_chrom[i, :], f_chrom[i, :], N, H, SH, F, TM, time)
+        # 存储最佳的选择
+        AP = []; AM = []; AF = []; AFit = []  # Elite archive # 操作序列、机器选择、工厂分配、适应度
+        i = 1
         # 创建模型
-        N_STATES=2*SH+N+3 #状态空间=操作序列+机器选择+工厂分配
-        CountOpers = np.zeros(N_ACTIONS) #用于记录每种操作被执行的次数
-        PopCountOpers = [] # 用于存储种群中每个个体的操作计数
+        N_STATES = 2 * SH + N + 3  # 状态空间=操作序列+机器选择+工厂分配
+        CountOpers = np.zeros(N_ACTIONS)  # 用于记录每种操作被执行的次数
+        PopCountOpers = []  # 用于存储种群中每个个体的操作计数
         dq_net = DQN(N_STATES, N_ACTIONS, BATCH_SIZE=batch_size, LR=lr, EPSILON=EPSILON, GAMMA=GAMMA, \
                      MEMORY_CAPACITY=MEMORY_CAPACITY, TARGET_REPLACE_ITER=TARGET_REPLACE_ITER)
-        Loss=[]
-        while NFEs<MaxNFEs:
-            print(FileName[file]+' round ',rround+1,'iter ',i)
+        Loss = []
+        while NFEs < MaxNFEs:
+            print(FileName[file] + ' round ', rround + 1, 'iter ', i)
             i = i + 1
             ChildP = np.zeros(shape=(2 * ps, SH), dtype=int)
             ChildM = np.zeros(shape=(2 * ps, SH), dtype=int)
             ChildF = np.zeros(shape=(2 * ps, N), dtype=int)
             ChildFit = np.zeros(shape=(2 * ps, 3))
             # 使用锦标赛选择方法选择父代个体
-            P_pool, M_pool, F_pool = tournamentSelection(p_chrom, m_chrom,f_chrom, fitness, ps, SH, N)
+            P_pool, M_pool, F_pool = tournamentSelection(p_chrom, m_chrom, f_chrom, fitness, ps, SH, N)
             # 生成子代
             for j in range(ps):
-                Fit1=np.zeros(3);Fit2=np.zeros(3);
-                P1, M1,F1, P2, M2,F2 = evolution(P_pool, M_pool,F_pool, j, Pc, Pm, ps, SH, N, H, NM, M)
-                #交叉和变异生成子代个体
-                Fit1[0],Fit1[1],Fit1[2] = CalfitDHFJFP(P1, M1,F1, N,H,SH,F,TM,time)
-                Fit2[0],Fit2[1],Fit2[2] = CalfitDHFJFP(P2, M2,F2, N,H,SH,F,TM,time)
-                #计算子代适应度
+                Fit1 = np.zeros(3);
+                Fit2 = np.zeros(3)
+                P1, M1, F1, P2, M2, F2 = evolution(P_pool, M_pool, F_pool, j, Pc, Pm, ps, SH, N, H, NM, M)
+                # 交叉和变异生成子代个体
+                Fit1[0], Fit1[1], Fit1[2] = CalfitDHFJFP(P1, M1, F1, N, H, SH, F, TM, time)
+                Fit2[0], Fit2[1], Fit2[2] = CalfitDHFJFP(P2, M2, F2, N, H, SH, F, TM, time)
+                # 计算子代适应度
                 NFEs = NFEs + 2;
                 t1 = j * 2;
                 t2 = j * 2 + 1
-                ChildP[t1, :] = copy.copy(P1);ChildM[t1, :] = copy.copy(M1);ChildF[t1, :] = copy.copy(F1);ChildFit[t1, :] = Fit1
-                ChildP[t2, :] = copy.copy(P2);ChildM[t2, :] = copy.copy(M2);ChildF[t2, :] = copy.copy(F2);ChildFit[t2, :] = Fit2
+                ChildP[t1, :] = copy.copy(P1); ChildM[t1, :] = copy.copy(M1); ChildF[t1, :] = copy.copy(F1); ChildFit[t1, :] = Fit1
+                ChildP[t2, :] = copy.copy(P2); ChildM[t2, :] = copy.copy(M2); ChildF[t2, :] = copy.copy(F2); ChildFit[t2, :] = Fit2
             QP = np.vstack((p_chrom, ChildP))
             QM = np.vstack((m_chrom, ChildM))
             QF = np.vstack((f_chrom, ChildF))
             QFit = np.vstack((fitness, ChildFit))
-            #合并子代与父代，vstake竖直堆叠数组
-            QP, QM, QF,QFit = DeleteReapt(QP, QM, QF,QFit, ps)
-            RQFit=QFit[:,0:2]
+            # 合并子代与父代，vstake竖直堆叠数组
+            QP, QM, QF, QFit = DeleteReapt(QP, QM, QF, QFit, ps)
+            RQFit = QFit[:, 0:2]
 
             TopRank = FastNDS(RQFit, ps)
             p_chrom = QP[TopRank, :];
@@ -1835,7 +1801,7 @@ for file in range(CCF,CCF+1):
                 AM = copy.copy(m_chrom[PF, :])
                 AF = copy.copy(f_chrom[PF, :])
                 AFit = copy.copy(fitness[PF, :])
-            #非支配解存入精英存档
+            # 非支配解存入精英存档
 
             # Elite strategy
             PF = pareto(fitness)
@@ -1854,13 +1820,13 @@ for file in range(CCF,CCF+1):
             AM = AM[PF, :];
             AF = AF[PF, :];
             AFit = AFit[PF, :];
-            AP,AM,AF,AFit= DeleteReaptE(AP, AM, AF,AFit)
+            AP, AM, AF, AFit = DeleteReaptE(AP, AM, AF, AFit)
 
-            #在精英存档中使用局部搜索策略
-            L=len(AFit)
-            current_state = np.zeros(N_STATES,dtype=int)
+            # 在精英存档中使用局部搜索策略
+            L = len(AFit)
+            current_state = np.zeros(N_STATES, dtype=int)
             next_state = np.zeros(N_STATES, dtype=int)
-            # 使用DQN选择局部搜索动作
+            # 使用 DQN 选择局部搜索动作
             for l in range(L):
                 current_state[0:SH] = copy.copy(AP[l, :])
                 current_state[SH:SH * 2] = copy.copy(AM[l, :])
@@ -1868,7 +1834,7 @@ for file in range(CCF,CCF+1):
                 current_state[N_STATES - 3:] = copy.copy(AFit[l, :])  # 存储 eta 值
 
                 action = dq_net.choose_action(current_state)
-                k=int(action)
+                k = int(action)
                 if k == 0:
                     P1, M1, F1 = N6(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, TM, NM, M, F)
                 elif k == 1:
@@ -1880,36 +1846,36 @@ for file in range(CCF,CCF+1):
                 elif k == 4:
                     P1, M1, F1 = InsertOF(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time)
                 elif k == 5:
-                    P1, M1, F1 = InsertIF(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time,F)
+                    P1, M1, F1 = InsertIF(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, F)
                 elif k == 6:
-                    P1, M1, F1 = SwapIF(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time,F)
+                    P1, M1, F1 = SwapIF(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, F)
                 elif k == 7:
-                    P1, M1, F1 = RankFA(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, TM, NM, M, F,ProF)
+                    P1, M1, F1 = RankFA(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, TM, NM, M, F, ProF)
                 elif k == 8:
                     P1, M1, F1 = RankMS(AP[l, :], AM[l, :], AF[l, :], AFit[l, :], N, H, SH, time, TM, NM, M, F)
 
                 Fit1 = np.zeros(3)  # 存储基于模糊数 eta 值
-                Fit1[0], Fit1[1], Fit1[2] = CalfitDHFJFP(P1, M1, F1, N, H, SH, F, TM, time) #计算每步的适应度
+                Fit1[0], Fit1[1], Fit1[2] = CalfitDHFJFP(P1, M1, F1, N, H, SH, F, TM, time)  # 计算基于模糊数 eta
                 NFEs = NFEs + 1
-                dom=NDS(Fit1, AFit[l, :])
-                if  dom== 1: #生成非支配解奖励为1
-                    AP[l, :] = copy.copy(P1);
-                    AM[l, :] = copy.copy(M1);
-                    AF[l, :] = copy.copy(F1);
+                dom = NDS(Fit1, AFit[l, :])
+                if dom == 1:  # 生成非支配解奖励为1
+                    AP[l, :] = copy.copy(P1)
+                    AM[l, :] = copy.copy(M1)
+                    AF[l, :] = copy.copy(F1)
                     AFit[l, :] = copy.copy(Fit1)
                     AP = np.vstack((AP, P1))
                     AM = np.vstack((AM, M1))
                     AF = np.vstack((AF, F1))
                     AFit = np.vstack((AFit, Fit1))
-                    reward=5
-                elif dom == 0 and AFit[l][0]!=Fit1[0] and AFit[l][1]!=Fit1[1]: #生成支配解奖励为10
+                    reward = 5
+                elif dom == 0 and AFit[l][0] != Fit1[0] and AFit[l][1] != Fit1[1]:  # 生成支配解奖励为10
                     AP = np.vstack((AP, P1))
                     AM = np.vstack((AM, M1))
                     AF = np.vstack((AF, F1))
                     AFit = np.vstack((AFit, Fit1))
                     reward = 10
                 else:
-                    reward=0
+                    reward = 0
                 next_state[0:SH] = copy.copy(P1)
                 next_state[SH:SH * 2] = copy.copy(M1)
                 next_state[SH * 2:N_STATES - 3] = copy.copy(F1)
@@ -1942,7 +1908,7 @@ for file in range(CCF,CCF+1):
                     AF = np.vstack((AF, F1))
                     AFit = np.vstack((AFit, Fit1))
 
-        #展示FA/Ms/OA
+        # 展示FA/Ms/OA
         PF = pareto(AFit)
         AP = AP[PF, :]
         AM = AM[PF, :]
@@ -1990,7 +1956,6 @@ for file in range(CCF,CCF+1):
 
         print("帕累托前沿解的目标值已保存到文件。")
 
-
         for i, idx in enumerate(unique_indices):
             print(f"Solution {i + 1}:")
             print(f"Operation Sequence: {AP[idx]}")
@@ -2000,11 +1965,10 @@ for file in range(CCF,CCF+1):
             print()
 
             # 绘制甘特图
-            # 绘制甘特图
             plt.figure(figsize=(12, 8))
             machine_info = {}  # 用于存储机器信息
-
             machine_start_time = {}  # 用于存储每个机器的当前开始时间 [a, b, c]
+            colors = plt.cm.tab20(np.linspace(0, 1, N))  # 按任务分配颜色
 
             for job in range(N):
                 start_time = [0, 0, 0]  # 初始化模糊开始时间
@@ -2025,13 +1989,11 @@ for file in range(CCF,CCF+1):
                     # 计算模糊开始时间 (使用前一个任务的完成时间)
                     if op > 0:
                         prev_op_finish = machine_info[machine_label][-1]['finish']
-                        start_time = [prev_op_finish[0] + t[0], prev_op_finish[1] + t[1],
-                                      prev_op_finish[2] + t[2]]  # 模糊加法
-                    else:
-                        start_time = [0, 0, 0] if op == 0 else machine_start_time[machine_label]  # 初始为 [0, 0, 0]
-
+                        start_time = [max(start_time[0], prev_op_finish[0]),
+                                      max(start_time[1], prev_op_finish[1]),
+                                      max(start_time[2], prev_op_finish[2])]
                     # 计算模糊完成时间
-                    finish_time = [start_time[0] + t[0], start_time[1] + t[1], start_time[2] + t[2]]  # 模糊加法
+                    finish_time = [start_time[0] + t[0], start_time[1] + t[1], start_time[2] + t[2]]
 
                     # 记录任务信息
                     task_info = {
@@ -2048,7 +2010,7 @@ for file in range(CCF,CCF+1):
 
             # 按工厂和机器编号排序
             sorted_machine_labels = sorted(machine_info.keys(),
-                                           key=lambda x: (-int(x.split('F')[1].split('M')[0]), -int(x.split('M')[1])))
+                                           key=lambda x: (int(x.split('F')[1].split('M')[0]), int(x.split('M')[1])))
 
             # 绘制甘特图
             y_pos = np.arange(len(sorted_machine_labels))  # 每个机器的y坐标位置
@@ -2059,17 +2021,16 @@ for file in range(CCF,CCF+1):
                     start = task['start']
                     duration = task['duration']
                     # 计算三角形顶点位置
-                    left = sum(start) / 3  # 使用平均值作为左顶点位置
-                    peak = left + duration[1]  # 顶点在 b 位置
-                    right = left + duration[2]  # 右顶点在 c 位置 (假设 a=0 相对)
+                    left = (start[0] + start[1] + start[2]) / 3  # 使用平均值作为左顶点位置
+                    peak = start[1] + duration[1]  # 顶点在 b 位置
+                    right = start[2] + duration[2]  # 右顶点在 c 位置
                     y_base = machine_idx - 0.5
                     y_peak = machine_idx + 0.5
 
                     # 绘制三角形
                     x = [left, peak, right]
                     y = [y_base, y_peak, y_base]
-                    color = "#{:06x}".format(random.randint(0, 0xFFFFFF))
-                    plt.fill(x, y, color=color, alpha=0.7, edgecolor='black')
+                    plt.fill(x, y, color=colors[task['job'] - 1], alpha=0.7, edgecolor='black')
 
                     # 在三角形内部标注操作标签
                     center_x = (left + right) / 2
@@ -2090,5 +2051,5 @@ for file in range(CCF,CCF+1):
             plt.tight_layout()
             plt.show()
 
-    print('finish '+FileName[file])
+    print('finish ' + FileName[file])
 print('finish running')
